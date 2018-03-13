@@ -38,6 +38,8 @@ class Connection:
             results = self.do_insert(tokens)
         elif tokens[0] == "SELECT":
             results = self.do_select(tokens)
+        elif tokens[0] == "DELETE":
+            results = self.do_delete(tokens)
         else:
             results = "Error"
         return results
@@ -47,6 +49,11 @@ class Connection:
         Empty method that will be used in future projects
         """
         pass
+
+    def do_delete(self,tokens):
+        table_name = tokens[tokens.index("FROM")+1]
+        predicate = parse_predicate(tokens)
+        return self.database.delete_record(table_name,predicate)
 
     def do_create(self,tokens):
         tokens = tokens[2:]
@@ -77,10 +84,8 @@ class Connection:
         table_name = tokens[tokens.index("FROM")+1]
         # get prdicate if it exists
         predicate = parse_predicate(tokens)
-        print(predicate)
         # get order column
         order = parse_order(tokens)
-        print(order)
         return self.database.get_records(table_name, columns, predicate, order)
 
 def connect(filename):
@@ -107,8 +112,12 @@ def parse_order(tokens):
 def parse_predicate(tokens):
     predicate = None
     if "WHERE" in tokens:
-        predicate_tokens = tokens[tokens.index("WHERE")+1:tokens.index("ORDER")]
-        predicate = Predicate(predicate_tokens)
+        if "ORDER" in tokens:
+            predicate_tokens = tokens[tokens.index("WHERE")+1:tokens.index("ORDER")]
+            predicate = Predicate(predicate_tokens)
+        else:
+            predicate_tokens = tokens[tokens.index("WHERE")+1:tokens.index(";")]
+            predicate = Predicate(predicate_tokens)
     return predicate 
 
 def parse_args_list(tokens):
@@ -208,6 +217,9 @@ class Database:
     def insert_record(self,table_name,record,columns):
         return self.tables[table_name].insert(record,columns)
 
+    def delete_record(self,table_name,predicate=None):
+        return self.tables[table_name].delete(predicate)
+
     def get_records(self,table_name,cols=None,pred=None,order=None):
         return self.tables[table_name].get(cols,pred,order)
 
@@ -238,8 +250,18 @@ class Table:
             value = column.convert(value)
             converted_record.append(value)
 
-        self.rows.append(tuple(converted_record))
+        self.rows.append(Row(self.name,self.columns,tuple(converted_record)))
         return True
+
+    def delete(self,predicate=None):
+        result = []
+        if predicate is not None:
+            for row in self.rows:
+                column = row.get_column(predicate.column_name)
+                value = row.get_element(predicate.column_name)
+                if not predicate.execute(value,column):
+                    result.append(row)
+        self.rows = result
 
     def _get_selected_columns_index(self,selected_cols):
         index_columns = []
@@ -253,7 +275,7 @@ class Table:
         expanded_columns = []
         for column in columns:
             if "*" in column:
-                expanded_columns += [column.name for column in self.columns]
+                expanded_columns += [column.full_name for column in self.columns]
             else:
                 expanded_columns.append(column)
         return expanded_columns
@@ -264,33 +286,46 @@ class Table:
         order_indexes = []
         for column_name in order:
             order_indexes.append(self._get_column_index(column_name))
-        print("Order Indexes: {}".format(order_indexes))
         def deref_row(row):
             sort_on = []
             for index in order_indexes:
-                sort_on.append(row[index])
+                sort_on.append(row.get_index(index))
             return sort_on
         rows.sort(key=deref_row)
         return rows
 
     def _get_column_index(self,column_name):
         for index,column in enumerate(self.columns):
-            if column_name == column.name:
+            if column_name == column.name or column_name == column.full_name:
                 return index
         return -1
 
     def _select_columns(self,columns,rows):
         result = []
+        for row in rows:
+            result_row = []
+            for column in columns:
+                result_row.append(row.get_element(column))
+            result.append(tuple(result_row))
+        return result
 
-
+    def _filter_rows(self,predicate,rows):
+        result = []
+        if predicate is None:
+            return rows
+        for row in rows:
+            column = row.get_column(predicate.column_name)
+            value = row.get_element(predicate.column_name)
+            if predicate.execute(value,column):
+                result.append(row)
+        return result
 
     def get(self,columns=None,predicate=None,order=None):
-        print("Predicate: {}".format(predicate))
-        print("Order: {}".format(order))
         columns = self._expand_columns(columns)
-        print("Columns: {}".format(columns))
         result = self.rows
         result = self._order_rows(order,result)
+        result = self._filter_rows(predicate,result)
+        result = self._select_columns(columns,result)
         return result
 
     def __str__(self):
@@ -305,8 +340,6 @@ class Table:
         selected = []
         updated_col_order = None
         selected = self._expand_columns(cols)
-        print("Selected: {}".format(selected))
-        print("Order: {}".format(order))
         if order is not None:
             order_indexes = []
             for column_name in order:
@@ -320,7 +353,6 @@ class Table:
                 #        else:
                 #            order_indexes.append(updated_col_order.index(index))
                 #        break
-            print("Order Indexes: {}".format(order_indexes))
             def deref_row(row):
                 sort_on = []
                 for index in order_indexes:
@@ -330,6 +362,35 @@ class Table:
                     
         return selected
 """
+
+class Row:
+    def __init__(self,table_names,columns,data):
+        self.table_names = table_names
+        self.headers = columns
+        self.data = data
+        self.pairs = dict(zip([column.name for column in columns],self.data))
+        self.long_pairs = dict(zip([column.full_name for column in columns],self.data))
+
+    def __str__(self):
+        return "{}".format(self.data)
+    __repr__ = __str__
+
+    def get_index(self,index):
+        return self.data[index]
+
+    def get_element(self,column_name):
+        if column_name in self.pairs:
+            return self.pairs[column_name]
+        elif column_name in self.long_pairs:
+            return self.long_pairs[column_name]
+        return None
+
+    def get_column(self,column_name):
+        for column in self.headers:
+            if column_name == column.name or column_name == column.full_name:
+                return column
+        return None
+
 class Column:
     """
     Models a column in a table
@@ -380,24 +441,20 @@ class Predicate:
         self.value = tokens[-1]
         self.operator = " ".join(tokens[1:-1])
 
-    def execute(self,value):
-        value = str(value) if value is not None else None
+    def execute(self,value,column):
+        compare = column.convert(self.value)
         if self.operator == "IS":
             return value is None
         elif self.operator == "IS NOT":
             return value is not None
         elif self.operator == ">":
-            return value is not None and value > self.value
+            return value is not None and value > compare
         elif self.operator == "<":
-            return value is not None and value < self.value
-        elif self.operator == ">=":
-            return value is not None and value >= self.value
-        elif self.operator == "<=":
-            return value is not None and value <= self.value
-        elif self.operator == "==":
-            return value is not None and value == self.value
+            return value is not None and value < compare
+        elif self.operator == "=":
+            return value is not None and value == compare
         elif self.operator == "!=":
-            return value is not None and value != self.value
+            return value is not None and value != compare
         return False
 
     def __str__(self):
@@ -407,13 +464,23 @@ class Predicate:
 
 if __name__ == '__main__':
     conn = connect("test.db")
-    conn.execute("CREATE TABLE students (id INTEGER, name TEXT, gpa REAL);")
-    conn.execute("INSERT INTO students (id, name) VALUES (1, 'sean'), (2, 'shaun'), (3, 'shawn');")
-    conn.execute("CREATE TABLE teachers (id INTEGER, name TEXT, age INTEGER);")
-    conn.execute("INSERT INTO teachers (name, id) VALUES ('josh', 1), ('charles', 2), ('bill', 3);")
-    result = conn.execute("SELECT name, id FROM students WHERE id > 1 ORDER BY name;")
+    conn.execute("CREATE TABLE table (one REAL, two INTEGER, three TEXT);")
+    conn.execute("INSERT INTO table VALUES (3.4, 43, 'happiness'), (5345.6, 42, 'sadness'), (43.24, 25, 'life');")
+    conn.execute("INSERT INTO table VALUES (323.4, 433, 'warmth'), (5.6, 42, 'thirst'), (4.4, 235, 'Skyrim');")
+    result = conn.execute("SELECT * FROM table WHERE two > 50 ORDER BY three, two, one;")
     print(result)
-    result = conn.execute("SELECT * FROM teachers WHERE name IS NOT NULL ORDER BY name;")
+    conn.execute("DELETE FROM table WHERE two > 50 ;")
+    result = conn.execute("SELECT * FROM table ORDER BY three, two, one;")
     print(result)
-    result = conn.execute("SELECT students.*, *, id FROM students WHERE id < 2 ORDER BY name, id;")
+
+    #conn.execute("CREATE TABLE students (id INTEGER, name TEXT, gpa REAL);")
+    #conn.execute("INSERT INTO students (id, name) VALUES (1, 'sean'), (2, 'shaun'), (3, 'shawn');")
+    #conn.execute("CREATE TABLE teachers (id INTEGER, name TEXT, age INTEGER);")
+    #conn.execute("INSERT INTO teachers (name, id) VALUES ('josh', 1), ('charles', 2), ('bill', 3);")
+    #result = conn.execute("SELECT name, id FROM students WHERE id > 1 ORDER BY name;")
+    #print(result)
+    #result = conn.execute("SELECT *, *, teacher.* FROM teachers WHERE name IS NOT NULL ORDER BY name;")
+    #print(result)
+    #result = conn.execute("SELECT students.name, id FROM students WHERE id < 2 ORDER BY name, id;")
+    #print(result)
     
