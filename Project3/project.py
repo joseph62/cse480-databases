@@ -69,15 +69,19 @@ class Connection:
 
 
     def do_select(self,tokens):
+        # remove SELECT keyword
         tokens = tokens[1:]
+        # get the columns to select
         columns = parse_selected_columns(tokens)
+        # get the table name to select from
         table_name = tokens[tokens.index("FROM")+1]
-        predicate = None
-        if "WHERE" in tokens:
-            pred_tokens = tokens[tokens.index("WHERE")+1:tokens.index("ORDER")]
-            print(pred_tokens)
-        order_cols = [ x[0] for x in parse_args_list(tokens[tokens.index("ORDER")+2:-1]) ]
-        return self.database.get_records(table_name,cols=columns,order=order_cols)
+        # get prdicate if it exists
+        predicate = parse_predicate(tokens)
+        print(predicate)
+        # get order column
+        order = parse_order(tokens)
+        print(order)
+        return self.database.get_records(table_name, columns, predicate, order)
 
 def connect(filename):
     """
@@ -93,6 +97,19 @@ def parse_records(tokens):
         records.append(tokens[start:end+1])
         tokens = tokens[end+1:]
     return records
+
+def parse_order(tokens):
+    order = None
+    if "ORDER" in tokens:
+        order = [ x[0] for x in parse_args_list(tokens[tokens.index("ORDER")+2:-1]) ]
+    return order
+
+def parse_predicate(tokens):
+    predicate = None
+    if "WHERE" in tokens:
+        predicate_tokens = tokens[tokens.index("WHERE")+1:tokens.index("ORDER")]
+        predicate = Predicate(predicate_tokens)
+    return predicate 
 
 def parse_args_list(tokens):
     results = []
@@ -224,7 +241,7 @@ class Table:
         self.rows.append(tuple(converted_record))
         return True
 
-    def get_selected_columns_index(self,selected_cols):
+    def _get_selected_columns_index(self,selected_cols):
         index_columns = []
         for col in selected_cols:
             for index,table_column in enumerate(self.columns):
@@ -233,25 +250,54 @@ class Table:
         return index_columns
 
     def _expand_columns(self,columns):
-        selected = []
-        if cols is None:
-            selected = self.rows
-        else:
-            expanded_cols = []
-            for col in cols:
-                if "*" in col:
-                    expanded_cols = expanded_cols + [column.name for column in self.columns]
-                else:
-                    expanded_cols.append(col)
-            updated_col_order = self.get_selected_columns_index(expanded_cols)
-            for row in self.rows:
-                result = []
-                for col in updated_col_order:
-                    result.append(row[col])
-                selected.append(tuple(result))
-        return selected
+        expanded_columns = []
+        for column in columns:
+            if "*" in column:
+                expanded_columns += [column.name for column in self.columns]
+            else:
+                expanded_columns.append(column)
+        return expanded_columns
+
+    def _order_rows(self,order,rows):
+        if order is None:
+            return rows
+        order_indexes = []
+        for column_name in order:
+            order_indexes.append(self._get_column_index(column_name))
+        print("Order Indexes: {}".format(order_indexes))
+        def deref_row(row):
+            sort_on = []
+            for index in order_indexes:
+                sort_on.append(row[index])
+            return sort_on
+        rows.sort(key=deref_row)
+        return rows
+
+    def _get_column_index(self,column_name):
+        for index,column in enumerate(self.columns):
+            if column_name == column.name:
+                return index
+        return -1
+
+    def _select_columns(self,columns,rows):
+        result = []
 
 
+
+    def get(self,columns=None,predicate=None,order=None):
+        print("Predicate: {}".format(predicate))
+        print("Order: {}".format(order))
+        columns = self._expand_columns(columns)
+        print("Columns: {}".format(columns))
+        result = self.rows
+        result = self._order_rows(order,result)
+        return result
+
+    def __str__(self):
+        return "{}: ({})".format(self.name,self.columns)
+    __repr__ = __str__
+
+"""
     def get(self,cols=None,pred=None,order=None):
         # Rethink order of operations/structure of this.
         # Right now we have to do some weird state tracking to
@@ -259,17 +305,22 @@ class Table:
         selected = []
         updated_col_order = None
         selected = self._expand_columns(cols)
-
+        print("Selected: {}".format(selected))
+        print("Order: {}".format(order))
         if order is not None:
             order_indexes = []
-            for order_index in order:
-                for index,col in enumerate(self.columns):
-                    if order_index == col.name:
-                        if updated_col_order is None:
-                            order_indexes.append(index)
-                        else:
-                            order_indexes.append(updated_col_order.index(index))
-                        break
+            for column_name in order:
+                order_index = self._get_column_index(column_name)
+                if order_index >= 0:
+                    order_indexes.append(order_index)
+                #for index,col in enumerate(self.columns):
+                #    if order_index == col.name:
+                #        if updated_col_order is None:
+                #            order_indexes.append(index)
+                #        else:
+                #            order_indexes.append(updated_col_order.index(index))
+                #        break
+            print("Order Indexes: {}".format(order_indexes))
             def deref_row(row):
                 sort_on = []
                 for index in order_indexes:
@@ -278,11 +329,7 @@ class Table:
             selected.sort(key=deref_row)
                     
         return selected
-
-    def __str__(self):
-        return "{}: ({})".format(self.name,self.columns)
-    __repr__ = __str__
-
+"""
 class Column:
     """
     Models a column in a table
@@ -325,6 +372,39 @@ def create_column(name, str_type, table_name):
         }
     return Column(name, type_map[str_type], table_name)
 
+class Predicate:
+    def __init__(self,tokens):
+        assert len(tokens) >= 3
+        self.tokens = tokens
+        self.column_name = tokens[0]
+        self.value = tokens[-1]
+        self.operator = " ".join(tokens[1:-1])
+
+    def execute(self,value):
+        value = str(value) if value is not None else None
+        if self.operator == "IS":
+            return value is None
+        elif self.operator == "IS NOT":
+            return value is not None
+        elif self.operator == ">":
+            return value is not None and value > self.value
+        elif self.operator == "<":
+            return value is not None and value < self.value
+        elif self.operator == ">=":
+            return value is not None and value >= self.value
+        elif self.operator == "<=":
+            return value is not None and value <= self.value
+        elif self.operator == "==":
+            return value is not None and value == self.value
+        elif self.operator == "!=":
+            return value is not None and value != self.value
+        return False
+
+    def __str__(self):
+        return "{} {} {}".format(self.column_name, self.operator, self.value)
+    __repr__ = __str__
+    
+
 if __name__ == '__main__':
     conn = connect("test.db")
     conn.execute("CREATE TABLE students (id INTEGER, name TEXT, gpa REAL);")
@@ -333,7 +413,7 @@ if __name__ == '__main__':
     conn.execute("INSERT INTO teachers (name, id) VALUES ('josh', 1), ('charles', 2), ('bill', 3);")
     result = conn.execute("SELECT name, id FROM students WHERE id > 1 ORDER BY name;")
     print(result)
-    result = conn.execute("SELECT * FROM teachers WHERE id < 2 ORDER BY name;")
+    result = conn.execute("SELECT * FROM teachers WHERE name IS NOT NULL ORDER BY name;")
     print(result)
-    result = conn.execute("SELECT students.*, *, col_1 FROM students WHERE id < 2 ORDER BY col_3, col_1;")
+    result = conn.execute("SELECT students.*, *, id FROM students WHERE id < 2 ORDER BY name, id;")
     
