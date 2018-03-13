@@ -1,7 +1,17 @@
 """
 Name: Sean Joseph
-Time To Completion: 
+Time To Completion: 12 hours
 Comments:
+    This project took me a while to complete due to
+    my project 2 code being awful. This project has
+    slightly better code for table get function and 
+    better orginization. It probably isn't anywhere
+    near what it should be, but it is better. 
+    Implementing join was so much easier than I thought
+    it would be. I was basically able to create a temporary
+    table from the two tables and run a SELECT on it as
+    if it were a regular table. Everything else was a slog.
+    
 Sources:
     Python Docs
 """
@@ -84,7 +94,6 @@ class Connection:
             self.database.insert_record(table_name,values,columns) 
 
     def do_select(self,tokens):
-        print(tokens)
         tokens = tokens[1:]
         columns = parse_selected_columns(tokens)
         distinct_columns = []
@@ -95,6 +104,34 @@ class Connection:
         table_name = tokens[tokens.index("FROM")+1]
         predicate = parse_predicate(tokens)
         order = parse_order(tokens)
+        assert self.database.has_table(table_name)
+        if "LEFT" in tokens:
+            join_table_name = tokens[tokens.index("JOIN")+1]
+            assert self.database.has_table(join_table_name)
+            assert "ON" in tokens
+            join_table = self.database.tables[join_table_name]
+            table = self.database.tables[table_name]
+            combined_columns = table.columns + join_table.columns
+            on_clause = parse_on_clause(tokens)
+            temp_table = Table("temp_join_table",combined_columns)
+            left_table_rows = table.rows
+            right_table_rows = join_table.rows
+            temp_table_rows = []
+            for left_row in left_table_rows:
+                left_element = left_row.get_element(on_clause.left_table_column)
+                left_column = left_row.get_column(on_clause.left_table_column)
+                result_right_row = []
+                for right_row in right_table_rows:
+                    right_element = right_row.get_element(on_clause.right_table_column)
+                    right_column = right_row.get_column(on_clause.right_table_column)
+                    result_right_row = [None] * len(right_row.data)
+                    if on_clause.execute(left_element,left_column,right_element,right_column):
+                        result_right_row = right_row.data
+                        break
+                combined_row = tuple(list(left_row.data) + list(result_right_row))
+                temp_table_rows.append(Row(temp_table.name,combined_columns,combined_row))
+            temp_table.rows = temp_table_rows
+            return temp_table.get(columns,predicate,order,distinct_columns)
         return self.database.get_records(table_name, columns, predicate, order, distinct_columns)
 
 def connect(filename):
@@ -102,6 +139,11 @@ def connect(filename):
     Creates a Connection object with the given filename
     """
     return Connection(filename)
+
+def parse_on_clause(tokens):
+    assert "ON" in tokens
+    clause = tokens[tokens.index("ON")+1:tokens.index("ON")+4]
+    return Clause(clause)
 
 def parse_records(tokens):
     records = []
@@ -465,6 +507,34 @@ def create_column(name, str_type, table_name):
         }
     return Column(name, type_map[str_type], table_name)
 
+class Clause:
+    def __init__(self,tokens):
+        assert len(tokens) >= 3
+        self.tokens = tokens
+        self.left_table_column = tokens[0]
+        self.right_table_column = tokens[-1]
+        self.operator = " ".join(tokens[1:-1])
+
+    def execute(self,left,left_column,right,right_column):
+        left_compare = left_column.convert(left)
+        right_compare = right_column.convert(right)
+        if left_compare is None or right_compare is None:
+            return False
+        if self.operator == ">":
+            return left_compare > right_compare
+        elif self.operator == "<":
+            return left_compare < right_compare
+        elif self.operator == "=":
+            return left_compare == right_compare
+        elif self.operator == "!=":
+            return left_compare != right_compare
+        return False
+
+    def __str__(self):
+        return "{} {} {}".format(self.left_table_column, self.operator, self.right_table_column)
+    __repr__ = __str__
+
+
 class Predicate:
     def __init__(self,tokens):
         assert len(tokens) >= 3
@@ -505,7 +575,7 @@ if __name__ == '__main__':
 
     conn.execute("INSERT INTO classes VALUES ('CSE480', 'Dr. Nahum'), ('CSE491', 'Dr. Josh'), ('CSE431', 'Dr. Ofria');")
 
-    conn.execute("SELECT students.name, students.grade, classes.course, classes.instructor FROM students LEFT OUTER JOIN classes ON students.class = classes.course ORDER BY classes.instructor, students.name, students.grade;")
+    print(conn.execute("SELECT students.name, students.grade, classes.course, classes.instructor FROM students LEFT OUTER JOIN classes ON students.class = classes.course ORDER BY classes.instructor, students.name, students.grade;"))
 
     #conn.execute("CREATE TABLE students (name TEXT, grade INTEGER, notes TEXT);")
     #conn.execute("INSERT INTO students VALUES ('Josh', 99, 'Likes Python'), ('Dennis', 99, 'Likes Networks'), ('Jie', 52, 'Likes Driving');")
