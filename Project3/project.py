@@ -34,12 +34,13 @@ class Connection:
         if tokens[0] == "CREATE" and tokens[1] == "TABLE":
             results = self.do_create(tokens)
         elif tokens[0] == "INSERT" and tokens[1] == "INTO":
-            tokens = tokens[2:]
             results = self.do_insert(tokens)
         elif tokens[0] == "SELECT":
             results = self.do_select(tokens)
         elif tokens[0] == "DELETE":
             results = self.do_delete(tokens)
+        elif tokens[0] == "UPDATE":
+            results = self.do_update(tokens)
         else:
             results = "Error"
         return results
@@ -55,6 +56,13 @@ class Connection:
         predicate = parse_predicate(tokens)
         return self.database.delete_record(table_name,predicate)
 
+    def do_update(self,tokens):
+        table_name = tokens[tokens.index("UPDATE")+1]
+        predicate = parse_predicate(tokens)
+        setter_value = parse_set(tokens)
+        return self.database.update_records(table_name,setter_value,predicate)
+
+
     def do_create(self,tokens):
         tokens = tokens[2:]
         table_name = tokens.pop(0)
@@ -64,6 +72,7 @@ class Connection:
         return self.database.has_table(table.name)
 
     def do_insert(self,tokens):
+        tokens = tokens[2:]
         table_name = tokens.pop(0)
         # Get rid of VALUES key word
         columns = None
@@ -72,21 +81,21 @@ class Connection:
         tokens = tokens[tokens.index("VALUES")+1:]
         for record in parse_records(tokens):
             values = [ arg[0] for arg in parse_args_list(record) ] 
-            self.database.insert_record(table_name,values,columns)
-
+            self.database.insert_record(table_name,values,columns) 
 
     def do_select(self,tokens):
-        # remove SELECT keyword
+        print(tokens)
         tokens = tokens[1:]
-        # get the columns to select
         columns = parse_selected_columns(tokens)
-        # get the table name to select from
+        distinct_columns = []
+        if "DISTINCT" in columns:
+            distinct_index = columns.index("DISTINCT") 
+            distinct_columns.append(columns[distinct_index+1])
+            columns.pop(distinct_index)
         table_name = tokens[tokens.index("FROM")+1]
-        # get prdicate if it exists
         predicate = parse_predicate(tokens)
-        # get order column
         order = parse_order(tokens)
-        return self.database.get_records(table_name, columns, predicate, order)
+        return self.database.get_records(table_name, columns, predicate, order, distinct_columns)
 
 def connect(filename):
     """
@@ -120,6 +129,22 @@ def parse_predicate(tokens):
             predicate = Predicate(predicate_tokens)
     return predicate 
 
+def parse_set(tokens):
+    start_index = tokens.index("SET")+1
+    end_index = tokens.index("WHERE") if "WHERE" in tokens else tokens.index(";")
+    set_list = tokens[start_index:end_index]
+    set_columns = []
+    set_column = []
+    for token in set_list:
+        if token == ",":
+            if len(set_column) > 0:
+                set_columns.append(set_column)
+                set_column = []
+        else:
+            set_column.append(token)
+    set_columns.append(set_column)
+    return set_columns
+
 def parse_args_list(tokens):
     results = []
     column_args = []
@@ -142,9 +167,6 @@ def parse_args_list(tokens):
 def parse_selected_columns(tokens):
     columns = []
     for token in tokens:
-        # Please forgive me god
-        if "." in token:
-            token = token.split(".")[1]
         if token == "FROM":
             break
         elif token == ",":
@@ -220,8 +242,11 @@ class Database:
     def delete_record(self,table_name,predicate=None):
         return self.tables[table_name].delete(predicate)
 
-    def get_records(self,table_name,cols=None,pred=None,order=None):
-        return self.tables[table_name].get(cols,pred,order)
+    def update_records(self,table_name,setter_columns,predicate=None):
+        return self.tables[table_name].set(setter_columns, predicate)
+
+    def get_records(self,table_name,cols=None,pred=None,order=None,distinct_columns=[]):
+        return self.tables[table_name].get(cols,pred,order,distinct_columns)
 
 class Table:
     """
@@ -245,7 +270,7 @@ class Table:
 
         converted_record = []
         for column in self.columns:
-            # get value or NULL if it isn't exist
+            # get value or NULL if it doesn't exist
             value = labeled_columns.get(column.name,"NULL")
             value = column.convert(value)
             converted_record.append(value)
@@ -262,6 +287,29 @@ class Table:
                 if not predicate.execute(value,column):
                     result.append(row)
         self.rows = result
+
+    def set(self,setter_columns,predicate=None):
+        for setter_column in setter_columns:
+            for row in self.rows:
+                set_column = row.get_column(setter_column[0])
+                set_value = set_column.convert(setter_column[-1])
+                if predicate is None:
+                    row.set_element(set_column.full_name,set_value)
+                else:
+
+                    predicate_column = row.get_column(predicate.column_name)
+                    predicate_value = row.get_element(predicate.column_name)
+                    if predicate.execute(predicate_value,predicate_column):
+                        row.set_element(set_column.full_name,set_value)
+
+    def get(self,columns=None,predicate=None,order=None,distinct_columns=[]):
+        columns = self._expand_columns(columns)
+        result = self.rows
+        result = self._order_rows(order,result)
+        result = self._filter_rows(predicate,result)
+        result = self._distinct_row(distinct_columns,result)
+        result = self._select_columns(columns,result)
+        return result
 
     def _get_selected_columns_index(self,selected_cols):
         index_columns = []
@@ -294,6 +342,20 @@ class Table:
         rows.sort(key=deref_row)
         return rows
 
+    def _distinct_row(self,distinct_columns,rows):
+        result = []
+        if len(distinct_columns) == 0:
+            return rows
+        track = set()
+        for distinct_column in distinct_columns:
+            for row in rows:
+                value = row.get_element(distinct_column)
+                if value not in track:
+                    track.add(value)
+                    result.append(row)
+        return result
+
+
     def _get_column_index(self,column_name):
         for index,column in enumerate(self.columns):
             if column_name == column.name or column_name == column.full_name:
@@ -320,48 +382,9 @@ class Table:
                 result.append(row)
         return result
 
-    def get(self,columns=None,predicate=None,order=None):
-        columns = self._expand_columns(columns)
-        result = self.rows
-        result = self._order_rows(order,result)
-        result = self._filter_rows(predicate,result)
-        result = self._select_columns(columns,result)
-        return result
-
     def __str__(self):
         return "{}: ({})".format(self.name,self.columns)
     __repr__ = __str__
-
-"""
-    def get(self,cols=None,pred=None,order=None):
-        # Rethink order of operations/structure of this.
-        # Right now we have to do some weird state tracking to
-        # order columns properly if column order changes.
-        selected = []
-        updated_col_order = None
-        selected = self._expand_columns(cols)
-        if order is not None:
-            order_indexes = []
-            for column_name in order:
-                order_index = self._get_column_index(column_name)
-                if order_index >= 0:
-                    order_indexes.append(order_index)
-                #for index,col in enumerate(self.columns):
-                #    if order_index == col.name:
-                #        if updated_col_order is None:
-                #            order_indexes.append(index)
-                #        else:
-                #            order_indexes.append(updated_col_order.index(index))
-                #        break
-            def deref_row(row):
-                sort_on = []
-                for index in order_indexes:
-                    sort_on.append(row[index])
-                return sort_on
-            selected.sort(key=deref_row)
-                    
-        return selected
-"""
 
 class Row:
     def __init__(self,table_names,columns,data):
@@ -384,6 +407,15 @@ class Row:
         elif column_name in self.long_pairs:
             return self.long_pairs[column_name]
         return None
+    
+    def set_element(self,column_name,value):
+        for index,(column,_) in enumerate(zip(self.headers,self.data)):
+            if column.name == column_name or column.full_name == column_name:
+                self.data = list(self.data)
+                self.data[index] = value 
+                self.data = tuple(self.data)
+                self.pairs[column.name] = value
+                self.long_pairs[column.full_name] = value
 
     def get_column(self,column_name):
         for column in self.headers:
@@ -464,14 +496,38 @@ class Predicate:
 
 if __name__ == '__main__':
     conn = connect("test.db")
-    conn.execute("CREATE TABLE table (one REAL, two INTEGER, three TEXT);")
-    conn.execute("INSERT INTO table VALUES (3.4, 43, 'happiness'), (5345.6, 42, 'sadness'), (43.24, 25, 'life');")
-    conn.execute("INSERT INTO table VALUES (323.4, 433, 'warmth'), (5.6, 42, 'thirst'), (4.4, 235, 'Skyrim');")
-    result = conn.execute("SELECT * FROM table WHERE two > 50 ORDER BY three, two, one;")
-    print(result)
-    conn.execute("DELETE FROM table WHERE two > 50 ;")
-    result = conn.execute("SELECT * FROM table ORDER BY three, two, one;")
-    print(result)
+
+    conn.execute("CREATE TABLE students (name TEXT, grade INTEGER, class TEXT);")
+    conn.execute("CREATE TABLE classes (course TEXT, instructor TEXT);")
+
+    conn.execute("INSERT INTO students VALUES ('Josh', 99, 'CSE480'), ('Dennis', 99, 'CSE480'), ('Jie', 52, 'CSE491');")
+    conn.execute("INSERT INTO students VALUES ('Cam', 56, 'CSE480'), ('Zizhen', 56, 'CSE491'), ('Emily', 74, 'CSE431');")
+
+    conn.execute("INSERT INTO classes VALUES ('CSE480', 'Dr. Nahum'), ('CSE491', 'Dr. Josh'), ('CSE431', 'Dr. Ofria');")
+
+    conn.execute("SELECT students.name, students.grade, classes.course, classes.instructor FROM students LEFT OUTER JOIN classes ON students.class = classes.course ORDER BY classes.instructor, students.name, students.grade;")
+
+    #conn.execute("CREATE TABLE students (name TEXT, grade INTEGER, notes TEXT);")
+    #conn.execute("INSERT INTO students VALUES ('Josh', 99, 'Likes Python'), ('Dennis', 99, 'Likes Networks'), ('Jie', 52, 'Likes Driving');")
+    #conn.execute("INSERT INTO students VALUES ('Cam', 56, 'Likes Anime'), ('Zizhen', 56, 'Likes Reading'), ('Emily', 74, 'Likes Environmentalism');")
+    #
+    #print(conn.execute("SELECT * FROM students ORDER BY name;"))
+    #print(conn.execute("SELECT DISTINCT grade FROM students ORDER BY grade;"))
+    #print(conn.execute("SELECT DISTINCT grade FROM students WHERE name < 'Emily' ORDER BY name;"))
+
+    #conn.execute("CREATE TABLE table (one REAL, two INTEGER, three TEXT);")
+    #conn.execute("INSERT INTO table VALUES (3.4, 43, 'happiness'), (5345.6, 42, 'sadness'), (43.24, 25, 'life');")
+    #conn.execute("INSERT INTO table VALUES (323.4, 433, 'warmth'), (5.6, 42, 'thirst'), (4.4, 235, 'Skyrim');")
+    #result = conn.execute("SELECT * FROM table WHERE two > 50 ORDER BY three, two, one;")
+    #print(result)
+    #conn.execute("DELETE FROM table WHERE two > 50 ;")
+    #result = conn.execute("SELECT * FROM table ORDER BY three, two, one;")
+    #print(result)
+    #conn.execute("UPDATE table SET table.one = 1.0;")
+    #conn.execute("UPDATE table SET table.one = 2.0, two = 100 WHERE two > 40;")
+    #result = conn.execute("SELECT * FROM table ORDER BY three, two, one;")
+    #print(result)
+
 
     #conn.execute("CREATE TABLE students (id INTEGER, name TEXT, gpa REAL);")
     #conn.execute("INSERT INTO students (id, name) VALUES (1, 'sean'), (2, 'shaun'), (3, 'shawn');")
