@@ -1,3 +1,4 @@
+#! /usr/bin/env python3
 """
 Name: Sean Joseph
 Time To Completion: 
@@ -7,22 +8,87 @@ Sources:
 """
 import string
 from enum import Enum 
-from operator import itemgetter
+from copy import deepcopy
+from pprint import pprint
 
+_LOCKS = {}
 _ALL_DATABASES = {}
+_CONNECTIONS = []
+
+def update_connections(db):
+    global _CONNECTIONS
+    global _ALL_DATABASES
+    for connection in _CONNECTIONS:
+        if connection.filename == db.filename and not connection.in_transaction:
+            connection.database = db
+    _ALL_DATABASES[db.filename] = db
+
+def grant_shared_lock(conn):
+    global _LOCKS
+    filename = conn.filename
+    if filename not in _LOCKS:
+        _LOCKS[filename] = []
+    for lock_conn,lock_type in _LOCKS[filename]:
+        if lock_type == Lock.Exclusive and conn != lock_conn:
+            return False
+    _LOCKS[filename].append((conn,Lock.Shared))
+    return True
+
+def grant_reserved_lock(conn):
+    global _LOCKS
+    filename = conn.filename
+    if filename not in _LOCKS:
+        _LOCKS[filename] = []
+    for lock_conn,lock_type in _LOCKS[filename]:
+        if ((lock_type == Lock.Exclusive or lock_type == Lock.Reserved)
+                and lock_conn != conn):
+            return False
+    _LOCKS[filename].append((conn,Lock.Reserved))
+    return True
+
+def grant_exclusive_lock(conn):
+    global _LOCKS
+    filename = conn.filename
+    if filename not in _LOCKS:
+        _LOCKS[filename] = []
+    for lock_conn,lock_type in _LOCKS[filename]:
+        if lock_conn != conn:
+            return False
+    _LOCKS[filename].append((conn,Lock.Exclusive))
+    return True
+
+def release_locks(conn):
+    global _LOCKS
+    filename = conn.filename
+    if filename not in _LOCKS:
+        _LOCKS[filename] = []
+    _LOCKS[filename] = [ lock for lock in _LOCKS[filename] if lock[0] != conn ]
+
+class Lock(Enum):
+    Shared = 0
+    Reserved = 1
+    Exclusive = 2
 
 class Connection:
-    def __init__(self, filename):
+    def __init__(self, filename, timeout, isolation_level):
         """
         Takes a filename, but doesn't do anything with it.
         (The filename will be used in a future project).
         """
         self.filename = filename
-        self.database = Database(filename)
+        self.timeout = timeout
+        self.isolation_level = isolation_level
+        self.in_transaction = False
+        #self.transaction_queries = []
         global _ALL_DATABASES
-        _ALL_DATABASES[filename] = self.database
+        global _CONNECTIONS
+        if filename not in _ALL_DATABASES:
+            self.database = Database(filename)
+            _ALL_DATABASES[filename] = self.database
+        else:
+            self.database = _ALL_DATABASES[filename]
+        _CONNECTIONS.append(self)
         
-
     def execute(self, statement):
         """
         Takes a SQL statement.
@@ -34,13 +100,27 @@ class Connection:
         if tokens[0] == "CREATE" and tokens[1] == "TABLE":
             results = self.do_create(tokens)
         elif tokens[0] == "INSERT" and tokens[1] == "INTO":
+            assert grant_reserved_lock(self)
             results = self.do_insert(tokens)
+        elif tokens[0] == "BEGIN":
+            results = self.begin_transaction(tokens)
+        elif tokens[0] == "COMMIT":
+            assert grant_exclusive_lock(self)
+            results = self.commit_transaction(tokens)
+        elif tokens[0] == "ROLLBACK":
+            results = self.rollback_transaction(tokens)
+
         elif tokens[0] == "SELECT":
+            assert grant_shared_lock(self)
             results = self.do_select(tokens)
         elif tokens[0] == "DELETE":
+            assert grant_reserved_lock(self)
             results = self.do_delete(tokens)
         elif tokens[0] == "UPDATE":
+            assert grant_reserved_lock(self)
             results = self.do_update(tokens)
+        elif tokens[0] == "DROP":
+            results = self.do_drop(tokens)
         else:
             results = "Error"
         return results
@@ -50,6 +130,31 @@ class Connection:
         Empty method that will be used in future projects
         """
         pass
+
+    def begin_transaction(self,tokens):
+        if self.in_transaction:
+            raise Exception("Connection already in transaction!")
+        if tokens[1] == "EXCLUSIVE":
+            assert grant_exclusive_lock(self)
+        elif tokens[1] == "IMMEDIATE":
+            assert grant_reserved_lock(self)
+
+        self.in_transaction = True
+        self.database = deepcopy(self.database)
+
+    def commit_transaction(self,tokens):
+        if not self.in_transaction:
+            raise Exception("Connection not in transaction!")
+        self.in_transaction = False
+        release_locks(self)
+        update_connections(self.database)
+
+    def rollback_transaction(self,tokens):
+        if not self.in_transaction:
+            raise Exception("Nothing to rollback!")
+        self.in_transaction = False
+        release_locks(self)
+        self.database = _ALL_DATABASES[self.filename] 
 
     def do_delete(self,tokens):
         table_name = tokens[tokens.index("FROM")+1]
@@ -62,13 +167,31 @@ class Connection:
         setter_value = parse_set(tokens)
         return self.database.update_records(table_name,setter_value,predicate)
 
+    def do_drop(self,tokens):
+        tokens = tokens[2:]
+        raise_if_not_exist = True
+        if tokens[0] == "IF":
+            tokens = tokens[2:]
+            raise_if_not_exist = False
+        table_name = tokens[0]
+        if raise_if_not_exist:
+            self.database.remove_table(table_name)
+        else: 
+            self.database.remove_table_if_exist(table_name)
 
     def do_create(self,tokens):
         tokens = tokens[2:]
+        raise_if_exist = True
+        if tokens[0] == "IF":
+            tokens = tokens[3:]
+            raise_if_exist = False
         table_name = tokens.pop(0)
         columns = parse_columns(tokens,table_name)
         table = Table(table_name,columns)
-        self.database.add_table(table)
+        if raise_if_exist:
+            self.database.add_table(table)
+        else:
+            self.database.add_table_if_not_exist(table)
         return self.database.has_table(table.name)
 
     def do_insert(self,tokens):
@@ -84,7 +207,6 @@ class Connection:
             self.database.insert_record(table_name,values,columns) 
 
     def do_select(self,tokens):
-        print(tokens)
         tokens = tokens[1:]
         columns = parse_selected_columns(tokens)
         distinct_columns = []
@@ -95,13 +217,15 @@ class Connection:
         table_name = tokens[tokens.index("FROM")+1]
         predicate = parse_predicate(tokens)
         order = parse_order(tokens)
-        return self.database.get_records(table_name, columns, predicate, order, distinct_columns)
-
-def connect(filename):
+        selected_rows = self.database.get_records(table_name, columns,
+                                                    predicate, order, 
+                                                    distinct_columns)
+        return selected_rows
+def connect(filename,timeout=0.1,isolation_level=None):
     """
     Creates a Connection object with the given filename
     """
-    return Connection(filename)
+    return Connection(filename,timeout,isolation_level)
 
 def parse_records(tokens):
     records = []
@@ -227,14 +351,35 @@ class Database:
         self.filename = filename
         self.tables = {}
 
+    def __deepcopy__(self,memo):
+        db = Database(self.filename)
+        for table in self.tables.values():
+            db.add_table(deepcopy(table))
+        return db
+
     def has_table(self,table_name):
         """
         returns true if table_name is in the list of tables
         """
         return table_name in self.tables
 
+    def remove_table(self,table_name):
+        if table_name not in self.tables:
+            raise Exception("Table '{}' doesn't exist!".format(table_name))
+        del self.tables[table_name]
+
+    def remove_table_if_exist(self,table_name):
+        if table_name in self.tables:
+            del self.tables[table_name] 
+
     def add_table(self,table):
+        if table.name in self.tables:
+            raise Exception("Table '{}' already exists!".format(table.name))
         self.tables[table.name] = table
+
+    def add_table_if_not_exist(self,table):
+        if table.name not in self.tables:
+            self.tables[table.name] = table
 
     def insert_record(self,table_name,record,columns):
         return self.tables[table_name].insert(record,columns)
@@ -258,6 +403,12 @@ class Table:
         self.name = name
         self.columns = columns
         self.rows = []
+
+    def __deepcopy__(self,memo):
+        table = Table(self.name,self.columns)
+        for row in self.rows:
+            table.rows.append(deepcopy(row))
+        return table
 
     def insert(self,record,columns):
         # Default to all columns
@@ -394,6 +545,10 @@ class Row:
         self.pairs = dict(zip([column.name for column in columns],self.data))
         self.long_pairs = dict(zip([column.full_name for column in columns],self.data))
 
+    def __deepcopy__(self,memo):
+        row = Row(self.table_names,self.headers,self.data)
+        return row 
+
     def __str__(self):
         return "{}".format(self.data)
     __repr__ = __str__
@@ -495,48 +650,34 @@ class Predicate:
     
 
 if __name__ == '__main__':
-    conn = connect("test.db")
+    import project
+    from pprint import pprint
 
-    conn.execute("CREATE TABLE students (name TEXT, grade INTEGER, class TEXT);")
-    conn.execute("CREATE TABLE classes (course TEXT, instructor TEXT);")
-
-    conn.execute("INSERT INTO students VALUES ('Josh', 99, 'CSE480'), ('Dennis', 99, 'CSE480'), ('Jie', 52, 'CSE491');")
-    conn.execute("INSERT INTO students VALUES ('Cam', 56, 'CSE480'), ('Zizhen', 56, 'CSE491'), ('Emily', 74, 'CSE431');")
-
-    conn.execute("INSERT INTO classes VALUES ('CSE480', 'Dr. Nahum'), ('CSE491', 'Dr. Josh'), ('CSE431', 'Dr. Ofria');")
-
-    conn.execute("SELECT students.name, students.grade, classes.course, classes.instructor FROM students LEFT OUTER JOIN classes ON students.class = classes.course ORDER BY classes.instructor, students.name, students.grade;")
-
-    #conn.execute("CREATE TABLE students (name TEXT, grade INTEGER, notes TEXT);")
-    #conn.execute("INSERT INTO students VALUES ('Josh', 99, 'Likes Python'), ('Dennis', 99, 'Likes Networks'), ('Jie', 52, 'Likes Driving');")
-    #conn.execute("INSERT INTO students VALUES ('Cam', 56, 'Likes Anime'), ('Zizhen', 56, 'Likes Reading'), ('Emily', 74, 'Likes Environmentalism');")
-    #
-    #print(conn.execute("SELECT * FROM students ORDER BY name;"))
-    #print(conn.execute("SELECT DISTINCT grade FROM students ORDER BY grade;"))
-    #print(conn.execute("SELECT DISTINCT grade FROM students WHERE name < 'Emily' ORDER BY name;"))
-
-    #conn.execute("CREATE TABLE table (one REAL, two INTEGER, three TEXT);")
-    #conn.execute("INSERT INTO table VALUES (3.4, 43, 'happiness'), (5345.6, 42, 'sadness'), (43.24, 25, 'life');")
-    #conn.execute("INSERT INTO table VALUES (323.4, 433, 'warmth'), (5.6, 42, 'thirst'), (4.4, 235, 'Skyrim');")
-    #result = conn.execute("SELECT * FROM table WHERE two > 50 ORDER BY three, two, one;")
-    #print(result)
-    #conn.execute("DELETE FROM table WHERE two > 50 ;")
-    #result = conn.execute("SELECT * FROM table ORDER BY three, two, one;")
-    #print(result)
-    #conn.execute("UPDATE table SET table.one = 1.0;")
-    #conn.execute("UPDATE table SET table.one = 2.0, two = 100 WHERE two > 40;")
-    #result = conn.execute("SELECT * FROM table ORDER BY three, two, one;")
-    #print(result)
+    def check(conn, sql_statement, expected):
+      print("SQL: " + sql_statement)
+      result = conn.execute(sql_statement)
+      result_list = list(result)
+      
+      print("expected:")
+      pprint(expected)
+      print("student: ")
+      pprint(result_list)
+      assert expected == result_list
+      
 
 
-    #conn.execute("CREATE TABLE students (id INTEGER, name TEXT, gpa REAL);")
-    #conn.execute("INSERT INTO students (id, name) VALUES (1, 'sean'), (2, 'shaun'), (3, 'shawn');")
-    #conn.execute("CREATE TABLE teachers (id INTEGER, name TEXT, age INTEGER);")
-    #conn.execute("INSERT INTO teachers (name, id) VALUES ('josh', 1), ('charles', 2), ('bill', 3);")
-    #result = conn.execute("SELECT name, id FROM students WHERE id > 1 ORDER BY name;")
-    #print(result)
-    #result = conn.execute("SELECT *, *, teacher.* FROM teachers WHERE name IS NOT NULL ORDER BY name;")
-    #print(result)
-    #result = conn.execute("SELECT students.name, id FROM students WHERE id < 2 ORDER BY name, id;")
-    #print(result)
-    
+    conn_1 = project.connect("test.db", timeout=0.1, isolation_level=None)
+    conn_2 = project.connect("test.db", timeout=0.1, isolation_level=None)
+    conn_3 = project.connect("test.db", timeout=0.1, isolation_level=None)
+    conn_4 = project.connect("test.db", timeout=0.1, isolation_level=None)
+
+
+    conn_1.execute("BEGIN TRANSACTION;")
+    pprint(_LOCKS)
+    conn_2.execute("BEGIN EXCLUSIVE TRANSACTION;")
+    pprint(_LOCKS)
+    conn_3.execute("BEGIN EXCLUSIVE TRANSACTION;")  
+    pprint(_LOCKS)
+    #conn_3.execute("BEGIN TRANSACTION;")  
+    #conn_2.execute("COMMIT TRANSACTION;")
+    #conn_4.execute("BEGIN EXCLUSIVE TRANSACTION;") 
