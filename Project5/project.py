@@ -111,7 +111,7 @@ class Connection:
         if tokens[0] == "CREATE" and tokens[1] == "TABLE":
             results = self.do_create(tokens)
         elif tokens[0] == "CREATE" and tokens[1] == "VIEW":
-            results = self.do_create(tokens)
+            results = self.do_view(tokens)
         elif tokens[0] == "INSERT" and tokens[1] == "INTO":
             assert grant_reserved_lock(self)
             results = self.do_insert(tokens)
@@ -198,6 +198,8 @@ class Connection:
     def do_view(self,tokens):
         tokens = tokens[2:]
         view_name = tokens.pop(0)
+        print("View name:",view_name)
+        print("Tokens:",tokens)
 
     def do_create(self,tokens):
         tokens = tokens[2:]
@@ -425,6 +427,7 @@ class Database:
     def __init__(self, filename):
         self.filename = filename
         self.tables = {}
+        self.views = {}
 
     def __deepcopy__(self,memo):
         db = Database(self.filename)
@@ -475,11 +478,16 @@ class View:
     def __init__(self,name,connection,query):
         self.conn = connection
         self.name = name
+        self.columns = parse_selected_columns(query)
         self.query = query
         self.table_name = query[query.find("FROM")+1]
-        self.table = self.conn.database[table_name]
-
+        self.view_table = self._generate_table() 
+    
+    def _generate_table(self):
+        base_table = self.conn.database[self.table_name]
+        
     def get(self,columns=None,predicate=None,order=None,distinct_columns=[]):
+
         rows = self.conn.do_select(query)
         
 
@@ -782,41 +790,36 @@ if __name__ == '__main__':
         print("student: ")
         pprint(result_list)
         assert expected == result_list
-
-        
+    
     conn = connect("test1.db")
-    conn.execute("CREATE TABLE students (name TEXT, grade REAL, course INTEGER);")
-    conn.execute("CREATE TABLE profs (name TEXT, course INTEGER);")
+    conn.execute("CREATE TABLE students (name TEXT, grade REAL);")
+    conn.execute("CREATE VIEW stu_view AS SELECT * FROM students WHERE grade > 3.0 ORDER BY name;")
 
-    conn.execute("""INSERT INTO students VALUES ('Zizhen', 4.0, 450),
-    ('Cam', 3.5, 480),
-    ('Cam', 3.0, 450),
-    ('Jie', 0.0, 231),
-    ('Jie', 2.0, 331),
-    ('Dennis', 2.0, 331),
-    ('Dennis', 2.0, 231),
-    ('Anne', 3.0, 231),
-    ('Josh', 1.0, 231),
-    ('Josh', 0.0, 480),
-    ('Josh', 0.0, 331);""")
 
-    conn.execute("""INSERT INTO profs VALUES ('Josh', 480),
-    ('Josh', 450),
-    ('Rich', 231),
-    ('Sebnem', 331);""")
-
-    check("""SELECT students.name
-    FROM students ORDER BY students.name DESC;""", 
+    check("""SELECT name FROM stu_view ORDER BY grade;""", 
     conn, 
-    [('Zizhen',),
-     ('Josh',),
-     ('Josh',),
-     ('Josh',),
-     ('Jie',),
-     ('Jie',),
-     ('Dennis',),
-     ('Dennis',),
-     ('Cam',),
-     ('Cam',),
-     ('Anne',)]
+    []
+     )
+     
+    conn.execute("""INSERT INTO students VALUES 
+    ('Josh', 3.5),
+    ('Dennis', 2.5),
+    ('Cam', 1.5),
+    ('Zizhen', 4.0)
+    ;""")
+
+    check("""SELECT name FROM stu_view ORDER BY grade;""", 
+    conn, 
+    [('Josh',), ('Zizhen',)]
+     )
+     
+    conn.execute("""INSERT INTO students VALUES 
+    ('Emily', 3.7),
+    ('Alex', 2.5),
+    ('Jake', 3.2)
+    ;""")
+
+    check("""SELECT name FROM stu_view ORDER BY grade;""", 
+    conn, 
+    [('Jake',), ('Josh',), ('Emily',), ('Zizhen',)]
      )
