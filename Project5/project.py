@@ -1,17 +1,8 @@
 #! /usr/bin/env python3
 """
 Name: Sean Joseph
-Time To Completion: 6 hours
+Time To Completion: 
 Comments:
-    For some reason I started out Project 4 without
-    my latest changes that implemented joins from
-    the previous project. I have no idea how that works.
-    This project did go much smoother than I thought it would
-    The locking functionality is implemented with a global dictionary
-    and some functions to manipulate it. That whole thing should
-    probably be encompassed in a Singleton or something. I'm already
-    interacting with the object through functions so it wouldn't be
-    too much of a strech. 
 Sources:
     Python Docs
 """
@@ -97,6 +88,17 @@ class Connection:
         else:
             self.database = _ALL_DATABASES[filename]
         _CONNECTIONS.append(self)
+
+    def executemany(self, statement, params):
+        def replace_params(statement,params):
+            result = statement
+            for elem in params:
+                result = result.replace("?",str(elem),1)
+            return result
+
+        for param in params:
+            paramed_statement = replace_params(statement,param)
+            self.execute(paramed_statement)
         
     def execute(self, statement):
         """
@@ -107,6 +109,8 @@ class Connection:
         tokens = parse_query(statement)
         results = None
         if tokens[0] == "CREATE" and tokens[1] == "TABLE":
+            results = self.do_create(tokens)
+        elif tokens[0] == "CREATE" and tokens[1] == "VIEW":
             results = self.do_create(tokens)
         elif tokens[0] == "INSERT" and tokens[1] == "INTO":
             assert grant_reserved_lock(self)
@@ -191,6 +195,10 @@ class Connection:
         else: 
             self.database.remove_table_if_exist(table_name)
 
+    def do_view(self,tokens):
+        tokens = tokens[2:]
+        view_name = tokens.pop(0)
+
     def do_create(self,tokens):
         tokens = tokens[2:]
         raise_if_exist = True
@@ -209,14 +217,18 @@ class Connection:
     def do_insert(self,tokens):
         tokens = tokens[2:]
         table_name = tokens.pop(0)
-        # Get rid of VALUES key word
         columns = None
+        default = "DEFAULT" in tokens
         if tokens[0] == "(":
             columns = [ column[0] for column in parse_args_list(tokens) ]
         tokens = tokens[tokens.index("VALUES")+1:]
-        for record in parse_records(tokens):
-            values = [ arg[0] for arg in parse_args_list(record) ] 
-            self.database.insert_record(table_name,values,columns) 
+        records = parse_records(tokens)
+        if len(records) == 0 and default:
+            self.database.insert_default_record(table_name)
+        else: 
+            for record in records:
+                values = [ arg[0] for arg in parse_args_list(record) ] 
+                self.database.insert_record(table_name,values,columns) 
 
     def do_select(self,tokens):
         tokens = tokens[1:]
@@ -229,6 +241,8 @@ class Connection:
         table_name = tokens[tokens.index("FROM")+1]
         predicate = parse_predicate(tokens)
         order = parse_order(tokens)
+        print(tokens)
+        print(order)
         if "LEFT" in tokens:
             join_table_name = tokens[tokens.index("JOIN")+1]
             assert self.database.has_table(join_table_name)
@@ -285,7 +299,15 @@ def parse_records(tokens):
 def parse_order(tokens):
     order = None
     if "ORDER" in tokens:
-        order = [ x[0] for x in parse_args_list(tokens[tokens.index("ORDER")+2:-1]) ]
+        order_list = parse_args_list(tokens[tokens.index("ORDER")+2:-1])
+        for order in order_list:
+            length = len(order)
+            assert length < 3 and length > 0
+            if length == 1:
+                order.append(False)
+            else:
+                order[1] = order[1] == "DESC"
+        order = order_list 
     return order
 
 def parse_predicate(tokens):
@@ -346,8 +368,15 @@ def parse_selected_columns(tokens):
     return columns
 
 def parse_columns(tokens,table_name):
-    results = [ create_column(name,_type,table_name) for name,_type in parse_args_list(tokens) ]
-    return results
+    args = parse_args_list(tokens)
+    columns = []
+    for arg in args:
+        if len(arg) == 4:
+            arg[2] = table_name
+        elif len(arg) == 2:
+            arg.append(table_name)
+        columns.append(create_column(*arg))
+    return columns
 
 def parse_query(query):
     results = []
@@ -430,6 +459,9 @@ class Database:
     def insert_record(self,table_name,record,columns):
         return self.tables[table_name].insert(record,columns)
 
+    def insert_default_record(self,table_name):
+        return self.tables[table_name].insert_default()
+
     def delete_record(self,table_name,predicate=None):
         return self.tables[table_name].delete(predicate)
 
@@ -438,6 +470,18 @@ class Database:
 
     def get_records(self,table_name,cols=None,pred=None,order=None,distinct_columns=[]):
         return self.tables[table_name].get(cols,pred,order,distinct_columns)
+
+class View:
+    def __init__(self,name,connection,query):
+        self.conn = connection
+        self.name = name
+        self.query = query
+        self.table_name = query[query.find("FROM")+1]
+        self.table = self.conn.database[table_name]
+
+    def get(self,columns=None,predicate=None,order=None,distinct_columns=[]):
+        rows = self.conn.do_select(query)
+        
 
 class Table:
     """
@@ -456,7 +500,7 @@ class Table:
             table.rows.append(deepcopy(row))
         return table
 
-    def insert(self,record,columns):
+    def insert(self,record,columns,):
         # Default to all columns
         if columns is None:
             columns = [ column.name for column in self.columns ]
@@ -464,16 +508,21 @@ class Table:
         # Make a dictionary to reference each column value by column name
         # Thanks Nahum for showing me this pattern
         labeled_columns = dict(zip(columns,record))
-
         converted_record = []
         for column in self.columns:
             # get value or NULL if it doesn't exist
-            value = labeled_columns.get(column.name,"NULL")
+            value = labeled_columns.get(column.name,column.default)
             value = column.convert(value)
             converted_record.append(value)
 
         self.rows.append(Row(self.name,self.columns,tuple(converted_record)))
         return True
+
+    def insert_default(self):
+        record = []
+        for column in self.columns:
+            record.append(column.default)
+        self.rows.append(Row(self.name,self.columns,tuple(record)))
 
     def delete(self,predicate=None):
         result = []
@@ -529,14 +578,11 @@ class Table:
         if order is None:
             return rows
         order_indexes = []
-        for column_name in order:
-            order_indexes.append(self._get_column_index(column_name))
-        def deref_row(row):
-            sort_on = []
-            for index in order_indexes:
-                sort_on.append(row.get_index(index))
-            return sort_on
-        rows.sort(key=deref_row)
+        for column_name,reverse in reversed(order):
+            index = self._get_column_index(column_name)
+            rows = sorted(rows,
+                          key=lambda row: row.get_element(column_name),
+                          reverse=reverse)
         return rows
 
     def _distinct_row(self,distinct_columns,rows):
@@ -630,10 +676,11 @@ class Column:
     name : Name of the column
     type : The type of data that goes in this column
     """
-    def __init__(self,name,_type,table_name):
+    def __init__(self,name,_type,table_name,default=None):
         self.name = name
         self.type = _type
         self.table_name = table_name
+        self.default= None if default is None else self.convert(default)
         self.full_name = "{}.{}".format(table_name,name)
 
     def convert(self,arg):
@@ -658,13 +705,13 @@ class ColumnType(Enum):
     REAL = 3
     TEXT = 4
 
-def create_column(name, str_type, table_name):
+def create_column(name, str_type, table_name, default=None):
     type_map = {
             "INTEGER" : ColumnType.INTEGER,
             "REAL" : ColumnType.REAL,
             "TEXT" : ColumnType.TEXT,
         }
-    return Column(name, type_map[str_type], table_name)
+    return Column(name, type_map[str_type], table_name, default)
 
 class Predicate:
     def __init__(self,tokens):
@@ -725,7 +772,7 @@ class Clause:
 
 if __name__ == '__main__':
 
-    def check(conn, sql_statement, expected):
+    def check(sql_statement, conn, expected):
         print("SQL: " + sql_statement)
         result = conn.execute(sql_statement)
         result_list = list(result)
@@ -736,33 +783,40 @@ if __name__ == '__main__':
         pprint(result_list)
         assert expected == result_list
 
+        
+    conn = connect("test1.db")
+    conn.execute("CREATE TABLE students (name TEXT, grade REAL, course INTEGER);")
+    conn.execute("CREATE TABLE profs (name TEXT, course INTEGER);")
 
-    conn_1 = connect("test.db", timeout=0.1, isolation_level=None)
-    conn_2 = connect("test.db", timeout=0.1, isolation_level=None)
-    conn_3 = connect("test.db", timeout=0.1, isolation_level=None)
-    conn_4 = connect("test.db", timeout=0.1, isolation_level=None)
-    conn_5 = connect("test.db", timeout=0.1, isolation_level=None)
+    conn.execute("""INSERT INTO students VALUES ('Zizhen', 4.0, 450),
+    ('Cam', 3.5, 480),
+    ('Cam', 3.0, 450),
+    ('Jie', 0.0, 231),
+    ('Jie', 2.0, 331),
+    ('Dennis', 2.0, 331),
+    ('Dennis', 2.0, 231),
+    ('Anne', 3.0, 231),
+    ('Josh', 1.0, 231),
+    ('Josh', 0.0, 480),
+    ('Josh', 0.0, 331);""")
 
+    conn.execute("""INSERT INTO profs VALUES ('Josh', 480),
+    ('Josh', 450),
+    ('Rich', 231),
+    ('Sebnem', 331);""")
 
-    conn_1.execute("CREATE TABLE students (name TEXT, id INTEGER);")
-    conn_2.execute("CREATE TABLE grades (grade INTEGER, name TEXT, student_id INTEGER);")
-
-    conn_3.execute("INSERT INTO students (id, name) VALUES (42, 'Josh'), (7, 'Cam');")
-    conn_2.execute("INSERT INTO grades VALUES (99, 'CSE480', 42), (80, 'CSE450', 42), (70, 'CSE480', 9);")
-
-    conn_2.execute("BEGIN DEFERRED TRANSACTION;")
-    conn_1.execute("BEGIN IMMEDIATE TRANSACTION;")
-    conn_1.execute("INSERT INTO grades VALUES (10, 'CSE231', 1);")
-    check(conn_2, "SELECT grades.grade, grades.name, students.name FROM grades LEFT OUTER JOIN students ON grades.student_id = students.id ORDER BY grades.name, grades.grade;",
-    [(80, 'CSE450', 'Josh'), (70, 'CSE480', None), (99, 'CSE480', 'Josh')]
-    )
-    check(conn_1, "SELECT grades.grade, grades.name, students.name FROM grades LEFT OUTER JOIN students ON grades.student_id = students.id ORDER BY grades.name, grades.grade;",
-    [(10, 'CSE231', None),
-    (80, 'CSE450', 'Josh'),
-    (70, 'CSE480', None),
-    (99, 'CSE480', 'Josh')]
-    )
-    conn_2.execute("COMMIT TRANSACTION;")
-    check(conn_2, "SELECT grades.grade, grades.name, students.name FROM grades LEFT OUTER JOIN students ON grades.student_id = students.id ORDER BY grades.name, grades.grade;",
-    [(80, 'CSE450', 'Josh'), (70, 'CSE480', None), (99, 'CSE480', 'Josh')]
-    )
+    check("""SELECT students.name
+    FROM students ORDER BY students.name DESC;""", 
+    conn, 
+    [('Zizhen',),
+     ('Josh',),
+     ('Josh',),
+     ('Josh',),
+     ('Jie',),
+     ('Jie',),
+     ('Dennis',),
+     ('Dennis',),
+     ('Cam',),
+     ('Cam',),
+     ('Anne',)]
+     )
