@@ -1,12 +1,20 @@
 #! /usr/bin/env python3
 """
 Name: Sean Joseph
-Time To Completion: 
+Time To Completion: 8 hours
 Comments:
+    This project was fairly difficult. Not because
+    the spec was overly demanding, but because design 
+    up until now has been lacking. My parsing system
+    should have been more separated from the execution
+    of the query statements. Perhaps having a separate
+    function or class that would go through and configure
+    a query object to be interpreted by my connection/database.
 Sources:
     Python Docs
+    Python Docs Sorting How To
 """
-import string
+import string, functools
 from enum import Enum 
 from copy import deepcopy
 from pprint import pprint
@@ -14,6 +22,7 @@ from pprint import pprint
 _LOCKS = {}
 _ALL_DATABASES = {}
 _CONNECTIONS = []
+_COLLATION = {}
 
 def update_connections(db):
     global _CONNECTIONS
@@ -88,6 +97,11 @@ class Connection:
         else:
             self.database = _ALL_DATABASES[filename]
         _CONNECTIONS.append(self)
+
+    def create_collation(self,name,func):
+        global _COLLATION
+        assert name not in _COLLATION
+        _COLLATION[name] = func
 
     def executemany(self, statement, params):
         def replace_params(statement,params):
@@ -198,8 +212,15 @@ class Connection:
     def do_view(self,tokens):
         tokens = tokens[2:]
         view_name = tokens.pop(0)
-        print("View name:",view_name)
-        print("Tokens:",tokens)
+        tokens = tokens[1:]
+        view = View(view_name,self,tokens)
+        self.database.add_view(view)
+        #table = Table(table_name,columns)
+        #if raise_if_exist:
+        #    self.database.add_table(table)
+        #else:
+        #    self.database.add_table_if_not_exist(table)
+        #return self.database.has_table(table.name)
 
     def do_create(self,tokens):
         tokens = tokens[2:]
@@ -235,6 +256,22 @@ class Connection:
     def do_select(self,tokens):
         tokens = tokens[1:]
         columns = parse_selected_columns(tokens)
+        def consolidate_aggregates(columns):
+            aggregates = {}
+            result_columns = []
+            while len(columns) > 0:
+                column = columns.pop(0)
+                if column in ["min","max"]:
+                    func = column
+                    columns.pop(0)
+                    column = columns.pop(0)
+                    columns.pop(0)
+                    aggregates[column] = func
+                    result_columns.append(column)
+                else:
+                    result_columns.append(column)
+            return (result_columns,aggregates) 
+        columns,aggregates = consolidate_aggregates(columns)
         distinct_columns = []
         if "DISTINCT" in columns:
             distinct_index = columns.index("DISTINCT") 
@@ -243,14 +280,12 @@ class Connection:
         table_name = tokens[tokens.index("FROM")+1]
         predicate = parse_predicate(tokens)
         order = parse_order(tokens)
-        print(tokens)
-        print(order)
         if "LEFT" in tokens:
             join_table_name = tokens[tokens.index("JOIN")+1]
             assert self.database.has_table(join_table_name)
             assert "ON" in tokens
-            join_table = self.database.tables[join_table_name]
-            table = self.database.tables[table_name]
+            join_table = self.database.get_table(join_table_name)
+            table = self.database.get_table(table_name)
             combined_columns = table.columns + join_table.columns
             on_clause = parse_on_clause(tokens)
             temp_table = Table("temp_join_table",combined_columns)
@@ -271,10 +306,11 @@ class Connection:
                 combined_row = tuple(list(left_row.data) + list(result_right_row))
                 temp_table_rows.append(Row(temp_table.name,combined_columns,combined_row))
             temp_table.rows = temp_table_rows
-            return temp_table.get(columns,predicate,order,distinct_columns)
+            return temp_table.get(columns,predicate,order,distinct_columns,aggregates)
         selected_rows = self.database.get_records(table_name, columns,
                                                     predicate, order, 
-                                                    distinct_columns)
+                                                    distinct_columns,
+                                                    aggregates)
         return selected_rows
 
 def connect(filename,timeout=0.1,isolation_level=None):
@@ -303,12 +339,19 @@ def parse_order(tokens):
     if "ORDER" in tokens:
         order_list = parse_args_list(tokens[tokens.index("ORDER")+2:-1])
         for order in order_list:
+            func = None
+            if "COLLATE" in order:
+                func_key = order.pop(order.index("COLLATE")+1)
+                order.pop(order.index("COLLATE"))
+                global _COLLATION
+                func = _COLLATION[func_key]
             length = len(order)
-            assert length < 3 and length > 0
+            assert length < 5 and length > 0
             if length == 1:
                 order.append(False)
             else:
                 order[1] = order[1] == "DESC"
+            order.append(func)
         order = order_list 
     return order
 
@@ -439,7 +482,13 @@ class Database:
         """
         returns true if table_name is in the list of tables
         """
-        return table_name in self.tables
+        return table_name in self.tables or table_name in self.views
+
+    def get_table(self,table_name):
+        if table_name in self.views:
+            return self.views[table_name]
+        else:
+            return self.tables[table_name]
 
     def remove_table(self,table_name):
         if table_name not in self.tables:
@@ -449,6 +498,9 @@ class Database:
     def remove_table_if_exist(self,table_name):
         if table_name in self.tables:
             del self.tables[table_name] 
+
+    def add_view(self,view):
+        self.views[view.name] = view
 
     def add_table(self,table):
         if table.name in self.tables:
@@ -471,24 +523,52 @@ class Database:
     def update_records(self,table_name,setter_columns,predicate=None):
         return self.tables[table_name].set(setter_columns, predicate)
 
-    def get_records(self,table_name,cols=None,pred=None,order=None,distinct_columns=[]):
-        return self.tables[table_name].get(cols,pred,order,distinct_columns)
+    def get_records(self,table_name,cols=None,pred=None,order=None,distinct_columns=[],aggregates={}):
+        if table_name in self.views:
+            return self.views[table_name].get(cols,pred,order,distinct_columns)
+        else:
+            return self.tables[table_name].get(cols,pred,order,distinct_columns,aggregates)
 
 class View:
     def __init__(self,name,connection,query):
-        self.conn = connection
         self.name = name
-        self.columns = parse_selected_columns(query)
+        self.conn = connection
         self.query = query
-        self.table_name = query[query.find("FROM")+1]
-        self.view_table = self._generate_table() 
-    
-    def _generate_table(self):
-        base_table = self.conn.database[self.table_name]
-        
-    def get(self,columns=None,predicate=None,order=None,distinct_columns=[]):
+        self.view_columns = parse_selected_columns(self.query[1:])
 
-        rows = self.conn.do_select(query)
+        self.table_names = [query[query.index("FROM")+1]]
+        if "LEFT" in query:
+            self.table_names.append(query[query.index("JOIN")+1])
+        
+    def _expand_columns(self,columns,all_columns):
+        expanded_columns = []
+        for column in columns:
+            if "*" in column:
+                expanded_columns += [column.full_name for column in all_columns]
+            else:
+                expanded_columns.append(column)
+        return expanded_columns
+
+    def get(self,columns=None,predicate=None,order=None,distinct_columns=[]):
+        rows = self.conn.do_select(self.query)
+        viewed_table_columns = []
+        for table_name in self.table_names:
+            viewed_table = self.conn.database.get_table(table_name) 
+            viewed_table_columns.extend(viewed_table.columns) 
+        view_columns = self._expand_columns(self.view_columns,viewed_table_columns)
+        view_columns = [x if "." not in x else x.split(".")[1] for x in view_columns]
+        result_columns = []
+        for column in viewed_table_columns:
+            name = column.name
+            full_name = column.full_name
+            if name in view_columns or full_name in view_columns:
+                new_column = Column(name,column.type,self.name,column.default)
+                result_columns.append(new_column)
+        temp_table = Table(self.name,result_columns)
+        for row in rows:
+            temp_table.insert(row,view_columns)
+        return temp_table.get(columns,predicate,order,distinct_columns)
+
         
 
 class Table:
@@ -508,7 +588,7 @@ class Table:
             table.rows.append(deepcopy(row))
         return table
 
-    def insert(self,record,columns,):
+    def insert(self,record,columns):
         # Default to all columns
         if columns is None:
             columns = [ column.name for column in self.columns ]
@@ -556,14 +636,32 @@ class Table:
                     if predicate.execute(predicate_value,predicate_column):
                         row.set_element(set_column.full_name,set_value)
 
-    def get(self,columns=None,predicate=None,order=None,distinct_columns=[]):
+    def get(self,columns=None,predicate=None,order=None,distinct_columns=[],aggregates={}):
         columns = self._expand_columns(columns)
         result = self.rows
         result = self._order_rows(order,result)
         result = self._filter_rows(predicate,result)
         result = self._distinct_row(distinct_columns,result)
         result = self._select_columns(columns,result)
+        result = self._execute_aggregates(aggregates,result,columns)
         return result
+
+    def _execute_aggregates(self,aggregates,rows,columns):
+        if len(aggregates) == 0:
+            return rows
+        result_row = []
+        for column_name,func in aggregates.items():
+            result_value = None
+            for row in rows:
+                value = row[columns.index(column_name)]
+                if result_value is None:
+                    result_value = value
+                elif func == "max":
+                    result_value = result_value if value < result_value else value
+                elif func == "min":
+                    result_value = result_value if value > result_value else value
+            result_row.append(result_value)
+        return [tuple(result_row)]
 
     def _get_selected_columns_index(self,selected_cols):
         index_columns = []
@@ -586,11 +684,20 @@ class Table:
         if order is None:
             return rows
         order_indexes = []
-        for column_name,reverse in reversed(order):
+        for column_name,reverse,coll in reversed(order):
             index = self._get_column_index(column_name)
-            rows = sorted(rows,
-                          key=lambda row: row.get_element(column_name),
-                          reverse=reverse)
+            if coll is None:
+                rows = sorted(rows,
+                              key=lambda row: row.get_element(column_name),
+                              reverse=reverse)
+            else:
+                #https://docs.python.org/3/howto/sorting.html#sortinghowto 
+                def collated(row):
+                    value = row.get_element(column_name)
+                    return functools.cmp_to_key(coll)(value)
+                rows = sorted(rows,
+                              key=collated,
+                              reverse=reverse)
         return rows
 
     def _distinct_row(self,distinct_columns,rows):
@@ -693,7 +800,7 @@ class Column:
 
     def convert(self,arg):
         converted = None
-        if arg == "NULL":
+        if arg == "NULL" or arg is None:
             pass
         elif self.type == ColumnType.INTEGER:
             converted = int(arg)
@@ -790,36 +897,23 @@ if __name__ == '__main__':
         print("student: ")
         pprint(result_list)
         assert expected == result_list
-    
-    conn = connect("test1.db")
-    conn.execute("CREATE TABLE students (name TEXT, grade REAL);")
-    conn.execute("CREATE VIEW stu_view AS SELECT * FROM students WHERE grade > 3.0 ORDER BY name;")
 
+    conn = connect("test.db")
+    conn.execute("CREATE TABLE students (name TEXT, grade REAL, class INTEGER);")
+    conn.executemany("INSERT INTO students VALUES (?, ?, ?);", 
+        [('Josh', 3.5, 480), 
+        ('Tyler', 2.5, 480), 
+        ('Tosh', 4.5, 450), 
+        ('Losh', 3.2, 450), 
+        ('Grant', 3.3, 480), 
+        ('Emily', 2.25, 450), 
+        ('James', 2.25, 450)])
+    check("SELECT max(grade) class FROM students ORDER BY grade;",
+    conn,
+    [(4.5,)]
+    )
 
-    check("""SELECT name FROM stu_view ORDER BY grade;""", 
-    conn, 
-    []
-     )
-     
-    conn.execute("""INSERT INTO students VALUES 
-    ('Josh', 3.5),
-    ('Dennis', 2.5),
-    ('Cam', 1.5),
-    ('Zizhen', 4.0)
-    ;""")
-
-    check("""SELECT name FROM stu_view ORDER BY grade;""", 
-    conn, 
-    [('Josh',), ('Zizhen',)]
-     )
-     
-    conn.execute("""INSERT INTO students VALUES 
-    ('Emily', 3.7),
-    ('Alex', 2.5),
-    ('Jake', 3.2)
-    ;""")
-
-    check("""SELECT name FROM stu_view ORDER BY grade;""", 
-    conn, 
-    [('Jake',), ('Josh',), ('Emily',), ('Zizhen',)]
-     )
+    check("SELECT min(class), max(name) FROM students ORDER BY grade, name;",
+    conn,
+    [(450, 'Tyler')]
+    )
